@@ -57,11 +57,12 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -C - \
             --speed-time 30 --speed-limit 50000 \
             -o upstream.AppImage "$url"
-          # integrity: manifest sha512 (base64) must decode to the file's sha256 hex
-          want="$(printf '%s' '${{ steps.upstream.outputs.sha512 }}' | base64 -d | sha256sum | cut -d' ' -f1)"
-          got="$(sha256sum upstream.AppImage | cut -d' ' -f1)"
+          # integrity: manifest sha512 field is the file's SHA-512 hex, base64-encoded
+          want="$(printf '%s' '${{ steps.upstream.outputs.sha512 }}' | base64 -d 2>/dev/null | xxd -p -c 128 | head -c 128)"
+          got="$(sha512sum upstream.AppImage | cut -d' ' -f1)"
           echo "manifest=$want"
           echo "file=$got"
+          [ "${#want}" = "128" ] || { echo "manifest decode failed"; exit 1; }
           [ "$want" = "$got" ] || { echo "SHA MISMATCH — upstream artifact corrupted or manifest stale"; exit 1; }
 
       - name: Extract

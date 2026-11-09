@@ -159,9 +159,9 @@ cmd_fetch() {
 	ls -la "$dl"
 	log "verify manifest vs file:"
 	local want got
-	want="$(grep -oP '(?<=sha512: ).+' "$dl/latest-linux.yml" | head -1 | base64 -d 2>/dev/null | sha256sum | cut -d' ' -f1 || true)"
-	got="$(sha "$dl"/DeepAI-Code-*-patched.AppImage)"
-	if [ -n "$want" ] && [ "$want" = "$got" ]; then
+	want="$(grep -oP '(?<=sha512: ).+' "$dl/latest-linux.yml" | head -1 | base64 -d 2>/dev/null | xxd -p -c 128 | head -c 128)"
+	got="$(sha512sum "$dl"/DeepAI-Code-*-patched.AppImage | cut -d' ' -f1)"
+	if [ "${#want}" = "128" ] && [ "$want" = "$got" ]; then
 		log "  sha512 MATCH ($got)"
 	else
 		die "sha512 MISMATCH: manifest=$want file=$got — refusing install"
