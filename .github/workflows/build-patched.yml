@@ -125,11 +125,15 @@ jobs:
         if: steps.skip.outputs.already-built != 'true'
         run: |
           cd work-tree/resources
-          npx --yes @electron/asar pack asar-out patched.asar
+          # asar pack with a RELATIVE dest silently no-ops when cwd shifts mid-run;
+          # use absolute path and verify the artifact exists before proceeding
+          npx --yes @electron/asar pack "$(pwd)/asar-out" "$(pwd)/patched.asar"
+          [ -f "$(pwd)/patched.asar" ] || { echo "FATAL: asar pack produced no output"; ls -la; exit 1; }
+          ls -la patched.asar
           cd ..
           rm -f resources/app
           rm -rf resources/app.asar.unpacked resources/asar-out
-          mv patched.asar resources/app.asar
+          mv resources/patched.asar resources/app.asar
           # regenerate .unpacked dir if asar produced one
           [ -d resources/patched.asar.unpacked ] && mv resources/patched.asar.unpacked resources/app.asar.unpacked || true
           mksquashfs . ../patched.squashfs -all-root -noappend -no-progress -comp gzip
