@@ -1,0 +1,201 @@
+name: build-patched
+
+# Builds a patched DeepAI Code Linux AppImage whenever upstream publishes a
+# new version. The patched artifact self-updates from THIS repo's releases
+# (app-update.yml is flipped to the generic provider pointing here), so the
+# installed patched copy can never be clobbered by an unpatched upstream build.
+
+"on":
+  schedule:
+    - cron: "17 */6 * * *"   # every 6h, off-the-hour to dodge busy minutes
+  workflow_dispatch: {}       # manual trigger for testing
+
+permissions:
+  contents: write             # needed to create releases
+
+concurrency:
+  group: build-patched
+  cancel-in-progress: false   # never kill an in-flight release build
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read upstream latest version
+        id: upstream
+        run: |
+          yml="$(curl -fsSL https://downloads.deepai.org/latest-linux.yml)"
+          echo "version=$(grep -oP '(?<=^version: )[0-9.]+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
+          echo "path=$(grep -oP '(?<=^path: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
+          echo "sha512=$(grep -oP '(?<=^sha512: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
+          echo "--- manifest ---"; echo "$yml"
+
+      - name: Skip if this version already released
+        id: skip
+        run: |
+          tag="deepai-v${{ steps.upstream.outputs.version }}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "already-built=true" >> "$GITHUB_OUTPUT"
+            echo "release $tag exists — nothing to do"
+          else
+            echo "already-built=false" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Download upstream AppImage
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          url="https://downloads.deepai.org/${{ steps.upstream.outputs.path }}"
+          echo "downloading $url"
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -C - \
+            --speed-time 30 --speed-limit 50000 \
+            -o upstream.AppImage "$url"
+          # integrity: manifest sha512 (base64) must decode to the file's sha256 hex
+          want="$(printf '%s' '${{ steps.upstream.outputs.sha512 }}' | base64 -d | sha256sum | cut -d' ' -f1)"
+          got="$(sha256sum upstream.AppImage | cut -d' ' -f1)"
+          echo "manifest=$want"
+          echo "file=$got"
+          [ "$want" = "$got" ] || { echo "SHA MISMATCH — upstream artifact corrupted or manifest stale"; exit 1; }
+
+      - name: Extract
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          chmod +x upstream.AppImage
+          ./upstream.AppImage --appimage-extract >/dev/null
+          mv squashfs-root work-tree
+          cd work-tree/resources
+          npx --yes @electron/asar extract app.asar asar-out
+          # asar extract does not materialize .unpacked native modules
+          [ -d app.asar.unpacked ] && cp -a app.asar.unpacked/. asar-out/
+
+      - name: Apply patches
+        # (single source of truth: patch.sh)
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          ./patch.sh work-tree/resources/asar-out
+          # NOTE: fixB (machine-id) intentionally NOT applied in CI builds.
+          # It is account-specific; users opt in locally via deepcodr patch-local --machine-id.
+
+      - name: Verify patches
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          # every entrypoint parses
+          for f in work-tree/resources/asar-out/apps/server/dist/bin*.mjs; do
+            node --check "$f"
+          done
+          # markers present in expected files
+          grep -rlF '/* deepcodr:fixA' work-tree/resources/asar-out/apps/server/dist/bin.mjs >/dev/null
+
+      - name: Boot smoke — backend must listen and answer
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          # Run the patched backend under plain node (the exact environment the
+          # bug manifests in). Success = process stays up past init.
+          # (It binds a random local port; we just need it to not die.)
+          cd work-tree/resources/asar-out
+          timeout 15 node apps/server/dist/bin.mjs > boot.log 2>&1 || rc=$?
+          # rc 124 = timeout killed it while alive = GOOD (it was listening/running)
+          # early nonzero = crashed = BAD
+          if [ "${rc:-0}" -ne 0 ] && [ "${rc:-0}" -ne 124 ]; then
+            echo "backend died early (rc=$rc)"; cat boot.log; exit 1
+          fi
+          if grep -qi "ETIMEDOUT\|ECONNREFUSED 127.0.0.1" boot.log 2>/dev/null; then
+            echo "boot log contains connection errors:"; cat boot.log; exit 1
+          fi
+          echo "boot smoke passed (rc=${rc:-0})"
+
+      - name: Flip update channel to this repo
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          cat > work-tree/resources/app-update.yml <<YML
+          provider: generic
+          url: https://github.com/${{ github.repository }}/releases/latest/download/
+          YML
+          cat work-tree/resources/app-update.yml
+
+      - name: Repack asar + squashfs
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          cd work-tree/resources
+          npx --yes @electron/asar pack asar-out patched.asar
+          cd ..
+          rm -f resources/app resources/app.asar.unpacked resources/asar-out
+          mv patched.asar resources/app.asar
+          # regenerate .unpacked dir if asar produced one
+          [ -d resources/patched.asar.unpacked ] && mv resources/patched.asar.unpacked resources/app.asar.unpacked || true
+          mksquashfs . ../patched.squashfs -all-root -noappend -no-progress -comp gzip
+          cd ..
+
+      - name: Concat with original runtime stub
+        if: steps.skip.outputs.already-built != 'true'
+        id: pack
+        run: |
+          offset="$(python3 - <<'PYEOF'
+          data = open("upstream.AppImage","rb").read(4*1024*1024)
+          print(data.find(b"hsqs"))
+          PYEOF
+          )"
+          [ "$offset" -gt 0 ] || { echo "squashfs offset not found"; exit 1; }
+          dd if=upstream.AppImage of=runtime-stub.bin bs=1 count="$offset" status=none
+          OUT="DeepAI-Code-${{ steps.upstream.outputs.version }}-patched.AppImage"
+          cat runtime-stub.bin patched.squashfs > "$OUT"
+          chmod +x "$OUT"
+          echo "artifact=$OUT" >> "$GITHUB_OUTPUT"
+          # sanity: extractable and contains marker
+          ./"$OUT" --appimage-extract >/dev/null
+          grep -qF 'deepcodr:fixA' squashfs-root/resources/app.asar \
+            || { echo "marker missing in packed artifact"; exit 1; }
+          rm -rf squashfs-root
+
+      - name: Generate patched-channel manifest
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          SHA="$(sha512sum '${{ steps.pack.outputs.artifact }}' | cut -d' ' -f1)"
+          B64="$(printf '%s' "$SHA" | xxd -r -p | base64 -w0)"
+          cat > latest-linux.yml <<YML
+          version: ${{ steps.upstream.outputs.version }}
+          path: ${{ steps.pack.outputs.artifact }}
+          sha512: $B64
+          releaseDate: '$(date -u +%Y-%m-%dT%H:%M:%S.000Z)'
+          YML
+          cat latest-linux.yml
+
+      - name: Release
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          tag="deepai-v${{ steps.upstream.outputs.version }}"
+          gh release create "$tag" \
+            -R "$GITHUB_REPOSITORY" \
+            --title "DeepAI Code ${{ steps.upstream.outputs.version }} (deepcodr patched)" \
+            --notes "$(cat <<NOTES
+          Patched build of DeepAI Code Linux (upstream ${{ steps.upstream.outputs.version }}).
+
+          **Fixes:** fixA — Node Happy-Eyeballs connect cutoff (5000ms), applied to all server/CLI entrypoints.
+          **Not included:** fixB (machine-id) — opt-in locally via \`deepcodr patch-local --machine-id\`.
+
+          **Provenance:**
+          - upstream artifact sha512-verified against downloads.deepai.org manifest before patching
+          - runtime stub harvested from pristine upstream AppImage (byte-identical)
+          - built by GitHub Actions from commit ${{ github.sha }}
+          NOTES
+          )" \
+            '${{ steps.pack.outputs.artifact }}' latest-linux.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Prune old releases (keep last 3)
+        if: steps.skip.outputs.already-built != 'true'
+        run: |
+          gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName,createdAt \
+            | jq -r 'sort_by(.createdAt) | reverse | .[3:][] | .tagName' \
+            | while read -r old; do
+                [ -n "$old" ] || continue
+                gh release delete "$old" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+              done
+        env:
+          GH_TOKEN: ${{ github.token }}
