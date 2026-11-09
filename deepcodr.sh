@@ -128,13 +128,11 @@ fetch("https://api.deepai.org/deepai_code/models", { signal: AbortSignal.timeout
 
 check_upstream_version() {
 	local yml
-	yml="$(curl -fsSL -m 15 https://downloads.deepai.org/latest-linux.yml 2>/dev/null)" || return 1
+	yml="$(curl -fsSL -m 15 https://downloads.deepai.org/deepai-code/releases/latest-linux.yml 2>/dev/null)" || return 1
 	local ver
 	ver="$(printf '%s' "$yml" | grep -oP '(?<=^version: )[0-9.]+' | head -1)"
-	local path
-	path="$(printf '%s' "$yml" | grep -oP '(?<=^path: ).+' | head -1)"
 	[ -n "$ver" ] || return 1
-	log "  upstream latest: $ver (path: $path)"
+	log "  upstream latest: $ver (url: $(printf '%s' "$yml" | grep -oP '(?<=url: ).+' | head -1))"
 	state_get patched_version >/dev/null || true
 	local pv
 	pv="$(state_get patched_version)"

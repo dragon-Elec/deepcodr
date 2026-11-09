@@ -28,10 +28,12 @@ jobs:
       - name: Read upstream latest version
         id: upstream
         run: |
-          yml="$(curl -fsSL https://downloads.deepai.org/latest-linux.yml)"
+          # the real feed: app-update.yml points at downloads.deepai.org/deepai-code/releases
+          yml="$(curl -fsSL https://downloads.deepai.org/deepai-code/releases/latest-linux.yml)"
           echo "version=$(grep -oP '(?<=^version: )[0-9.]+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
-          echo "path=$(grep -oP '(?<=^path: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
-          echo "sha512=$(grep -oP '(?<=^sha512: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
+          # electron-updater manifest: files[].url + files[].sha512 (AppImage is the first entry)
+          echo "url=$(grep -oP '(?<=url: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
+          echo "sha512=$(grep -oP '(?<=sha512: ).+' <<<"$yml" | head -1)" >> "$GITHUB_OUTPUT"
           echo "--- manifest ---"; echo "$yml"
 
       - name: Skip if this version already released
@@ -50,7 +52,7 @@ jobs:
       - name: Download upstream AppImage
         if: steps.skip.outputs.already-built != 'true'
         run: |
-          url="https://downloads.deepai.org/${{ steps.upstream.outputs.path }}"
+          url="${{ steps.upstream.outputs.url }}"
           echo "downloading $url"
           curl -fL --retry 5 --retry-delay 3 --retry-all-errors -C - \
             --speed-time 30 --speed-limit 50000 \
