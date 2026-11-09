@@ -51,18 +51,24 @@ for entry in "$APPS_DIST"/bin.mjs "$APPS_DIST"/binCli-*.mjs; do
 		skipped_a=$((skipped_a + 1))
 		continue
 	fi
-	# Anchor: entry must be an ES module starting with import/export — protects
-	# against silently prepending to some other file type by pattern accident.
-	if ! head -c 4096 "$entry" | grep -qE '^(import|export) '; then
-		echo "FATAL: anchor drift in $entry: not an ESM entry (no leading import/export)" >&2
+	# Anchor: entry must be an ES module (import/export within the first bytes) —
+	# protects against silently prepending to some other file type by pattern accident.
+	# Note: files start with a shebang; the import/export check must tolerate it.
+	if ! head -c 4096 "$entry" | grep -qE '^(import|export) |^#!.*node'; then
+		echo "FATAL: anchor drift in $entry: not an ESM entry" >&2
 		exit 1
 	fi
-	tmp="$entry.deepcodr.tmp"
+	tmp="${entry%.mjs}.deepcodr.mjs"   # must keep .mjs: node --check rejects other extensions
 	{
 		echo "$MARKER_A"
 		echo "$FIX_A_IMPORT"
 		echo "$FIX_A_CALL"
-		cat "$entry"
+		# strip shebang first if present: Node ESM rejects shebang after an import
+		if head -c 2 "$entry" | grep -q '#!'; then
+			tail -n +2 "$entry"
+		else
+			cat "$entry"
+		fi
 	} > "$tmp"
 	node --check "$tmp" 2>/dev/null || { echo "FATAL: fixA made $entry unparseable" >&2; rm -f "$tmp"; exit 1; }
 	mv "$tmp" "$entry"
