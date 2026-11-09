@@ -127,7 +127,8 @@ jobs:
           cd work-tree/resources
           npx --yes @electron/asar pack asar-out patched.asar
           cd ..
-          rm -f resources/app resources/app.asar.unpacked resources/asar-out
+          rm -f resources/app
+          rm -rf resources/app.asar.unpacked resources/asar-out
           mv patched.asar resources/app.asar
           # regenerate .unpacked dir if asar produced one
           [ -d resources/patched.asar.unpacked ] && mv resources/patched.asar.unpacked resources/app.asar.unpacked || true
