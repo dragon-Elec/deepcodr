@@ -211,11 +211,24 @@ jobs:
       - name: Prune old releases (keep last 3)
         if: steps.skip.outputs.already-built != 'true'
         run: |
-          gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName,createdAt \
-            | jq -r 'sort_by(.createdAt) | reverse | .[3:][] | .tagName' \
+          # NEVER prune by createdAt: on re-created tags GitHub returns the ORIGINAL
+          # release date, so a brand-new release can sort as the oldest and prune
+          # itself. Sort by semver from the tag, and hard-exclude the current tag.
+          cur="deepai-v${{ steps.upstream.outputs.version }}"
+          gh release list -R "$GITHUB_REPOSITORY" --limit 50 --json tagName,isLatest \
+            | jq -r --arg cur "$cur" '
+                map(select(.tagName != $cur))
+                | sort_by(.tagName | sub("deepai-v";"") | split(".") | map(tonumber))
+                | reverse
+                | .[3:][]
+                | .tagName' \
             | while read -r old; do
                 [ -n "$old" ] || continue
+                echo "pruning old release: $old"
                 gh release delete "$old" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
               done
+          # final assert: the current release must exist after pruning
+          gh release view "$cur" -R "$GITHUB_REPOSITORY" >/dev/null \
+            || { echo "FATAL: prune deleted the current release $cur"; exit 1; }
         env:
           GH_TOKEN: ${{ github.token }}
