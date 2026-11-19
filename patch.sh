@@ -13,8 +13,21 @@
 #           calls may be answered with machine_required. Adds a Linux branch
 #           reading /etc/machine-id (sha256-hashed, same treatment as the
 #           other platforms). Account-specific: enabled by --machine-id.
+#   FIX C1 — Self-hosted update feed. Upstream 0.3.42 calls
+#           electronUpdater.setFeedURL({ url: "https://downloads.deepai.org/..." })
+#           at runtime, which OVERRIDES resources/app-update.yml. Flipping the
+#           yml alone is therefore inert (proven: a patched 0.3.41 copy
+#           silently replaced itself with upstream's 0.3.42). C1 rewrites the
+#           hardcoded URL in apps/desktop/dist-electron/main.cjs so the
+#           patched build actually self-updates from our channel.
+#           Requires --feed-url=<url>; skipped when absent.
+#   FIX C2 — Restore the live transport capability in models.json. 0.3.42
+#           writes the literal placeholder "$T3_DEEPAI_TOKEN" instead of
+#           account.transport.capability (a deliberate upstream hardening),
+#           so no on-disk file authenticates against the app's transport.
+#           C2 restores exactly what 0.3.41 wrote — nothing invented.
 #
-# Usage: patch.sh <asar-out-dir> [--machine-id]
+# Usage: patch.sh <asar-out-dir> [--machine-id] [--feed-url=<url>]
 #   Modifies files in place inside <asar-out-dir>. Caller is responsible for
 #   having extracted a pristine asar and for packing/verifying afterwards.
 #   Exit 0 = applied (or already applied). Exit 1 = anchor missing / drift.
@@ -24,9 +37,22 @@ set -euo pipefail
 MARKER_A='/* deepcodr:fixA net-autoselect-timeout */'
 MARKER_B='/* deepcodr:fixB linux-machine-id */'
 
-ASAR_OUT="${1:?usage: patch.sh <asar-out-dir> [--machine-id]}"
+ASAR_OUT=""
 WANT_MACHINE_ID=0
-[ "${2:-}" = "--machine-id" ] && WANT_MACHINE_ID=1
+FEED_URL=""
+for arg in "$@"; do
+	case "$arg" in
+		--machine-id) WANT_MACHINE_ID=1 ;;
+		--feed-url=*) FEED_URL="${arg#--feed-url=}" ;;
+		--*) echo "FATAL: unknown option: $arg" >&2; exit 1 ;;
+		*) ASAR_OUT="$arg" ;;
+	esac
+done
+
+if [ -z "$ASAR_OUT" ]; then
+	echo "usage: patch.sh <asar-out-dir> [--machine-id] [--feed-url=<url>]" >&2
+	exit 1
+fi
 
 if [ ! -d "$ASAR_OUT" ]; then
 	echo "FATAL: $ASAR_OUT is not a directory" >&2
@@ -179,5 +205,81 @@ PYEOF
 	fi
 fi
 
-echo "patch summary: fixA applied=$applied_a skipped=$skipped_a upstream=$upstream_a | fixB applied=$applied_b skipped=$skipped_b upstream=$upstream_b requested=$WANT_MACHINE_ID"
+# ---------- FIX C1: self-hosted update feed (runtime override) ----------
+# Upstream 0.3.42 hardcodes setFeedURL({url:"https://downloads.deepai.org/..."}),
+# which wins over resources/app-update.yml. Rewrite that literal so the patched
+# build really fetches our channel. Anchor-count-checked: must match exactly one site.
+applied_c1=0
+skipped_c1=0
+if [ -n "$FEED_URL" ]; then
+	MAIN_CJS="$ASAR_OUT/apps/desktop/dist-electron/main.cjs"
+	if [ ! -f "$MAIN_CJS" ]; then
+		echo "FATAL: fixC1: $MAIN_CJS not found (layout drift)" >&2
+		exit 1
+	fi
+	UPSTREAM_URL='https://downloads.deepai.org/deepai-code/releases'
+	if grep -qF "$FEED_URL" "$MAIN_CJS"; then
+		echo "fixC1: feed already points at $FEED_URL (already applied)"
+		skipped_c1=1
+	else
+		hits=$(grep -cF "$UPSTREAM_URL" "$MAIN_CJS" || true)
+		if [ "$hits" -ne 1 ]; then
+			echo "FATAL: fixC1: expected exactly 1 feed site, found $hits (version drift)" >&2
+			exit 1
+		fi
+		# Literal URL swap only — no code shape change, so no syntax risk.
+		python3 - "$MAIN_CJS" "$UPSTREAM_URL" "$FEED_URL" <<'PYEOF'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path, encoding="utf-8").read()
+if src.count(old) != 1:
+    print(f"FATAL: fixC1 count drift ({src.count(old)})", file=sys.stderr); sys.exit(1)
+open(path, "w", encoding="utf-8").write(src.replace(old, new))
+print("patched")
+PYEOF
+		[ $? -eq 0 ] || { echo "FATAL: fixC1 injection failed" >&2; exit 1; }
+		node --check "$MAIN_CJS" || { echo "FATAL: fixC1 made main.cjs unparseable" >&2; exit 1; }
+		applied_c1=1
+	fi
+else
+	echo "fixC1: no --feed-url given — leaving upstream feed untouched"
+fi
+
+# ---------- FIX C2: restore the live transport capability ----------
+# 0.3.42 writes the literal "$T3_DEEPAI_TOKEN"; 0.3.41 wrote the real value.
+# Exact restore, anchored on the whole call so we cannot hit an unrelated string.
+applied_c2=0
+skipped_c2=0
+PLACEHOLDER_ANCHOR='deepAIPiModels(account.transport.baseUrl, "$T3_DEEPAI_TOKEN", models)'
+RESTORED_ANCHOR='deepAIPiModels(account.transport.baseUrl, account.transport.capability, models)'
+c2_target=""
+for f in "$APPS_DIST"/binCli-*.mjs; do
+	[ -f "$f" ] || continue
+	if grep -qF "$RESTORED_ANCHOR" "$f"; then c2_target="$f"; skipped_c2=1; break; fi
+	if grep -qF "$PLACEHOLDER_ANCHOR" "$f"; then c2_target="$f"; break; fi
+done
+if [ -z "$c2_target" ]; then
+	echo "fixC2: no models.json capability anchor found — upstream may have changed the shape; NOT patching"
+else
+	if [ "$skipped_c2" -eq 1 ]; then
+		echo "fixC2: capability already restored (already applied)"
+	else
+		python3 - "$c2_target" <<'PYEOF'
+import sys
+path = sys.argv[1]
+old = 'deepAIPiModels(account.transport.baseUrl, "$T3_DEEPAI_TOKEN", models)'
+new = 'deepAIPiModels(account.transport.baseUrl, account.transport.capability, models)'
+src = open(path, encoding="utf-8").read()
+if src.count(old) != 1:
+    print(f"FATAL: fixC2 count drift ({src.count(old)})", file=sys.stderr); sys.exit(1)
+open(path, "w", encoding="utf-8").write(src.replace(old, new))
+print("patched")
+PYEOF
+		[ $? -eq 0 ] || { echo "FATAL: fixC2 injection failed" >&2; exit 1; }
+		node --check "$c2_target" || { echo "FATAL: fixC2 made $c2_target unparseable" >&2; exit 1; }
+		applied_c2=1
+	fi
+fi
+
+echo "patch summary: fixA applied=$applied_a skipped=$skipped_a upstream=$upstream_a | fixB applied=$applied_b skipped=$skipped_b upstream=$upstream_b requested=$WANT_MACHINE_ID | fixC1 applied=$applied_c1 skipped=$skipped_c1 | fixC2 applied=$applied_c2 skipped=$skipped_c2"
 exit 0

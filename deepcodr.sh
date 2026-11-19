@@ -25,6 +25,9 @@ WORK="${DEEPCODR_WORK:-$DC_DIR/work}"
 STATE="$WORK/state.json"
 UPSTREAM_APPIMAGE_GLOB="$DC_DIR/DeepAI-Code-*.AppImage"
 REPO="${DEEPCODR_REPO:-}"   # set by fetch from gh, or owner/name env
+# Self-hosted update channel written into the patched build (fixC1).
+# Defaults to the canonical public channel; override with DEEPCODR_FEED_URL.
+FEED_URL="${DEEPCODR_FEED_URL:-https://github.com/dragon-Elec/deepcodr/releases/latest/download/}"
 
 log()  { printf '[deepcodr] %s\n' "$*"; }
 warn() { printf '[deepcodr] WARN: %s\n' "$*" >&2; }
@@ -207,8 +210,8 @@ cmd_patch_local() {
 		fi
 	fi
 
-	log "applying patches (fixA mandatory, fixB ${machine_id_flag:-off})..."
-	"$DC_DIR/patch.sh" "$out" $machine_id_flag
+	log "applying patches (fixA mandatory, fixB ${machine_id_flag:-off}, fixC1 feed, fixC2 capability)..."
+	"$DC_DIR/patch.sh" "$out" $machine_id_flag --feed-url="$FEED_URL"
 
 	# The patch: one symlink. Electron loads resources/app/ over app.asar.
 	if [ ! -L "$sfs/resources/app" ]; then

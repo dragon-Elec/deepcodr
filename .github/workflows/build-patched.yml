@@ -80,7 +80,8 @@ jobs:
         # (single source of truth: patch.sh)
         if: steps.skip.outputs.already-built != 'true'
         run: |
-          ./patch.sh work-tree/resources/asar-out
+          FEED_URL="https://github.com/${{ github.repository }}/releases/latest/download/"
+          ./patch.sh work-tree/resources/asar-out --feed-url="$FEED_URL"
           # NOTE: fixB (machine-id) intentionally NOT applied in CI builds.
           # It is account-specific; users opt in locally via deepcodr patch-local --machine-id.
 
@@ -101,6 +102,27 @@ jobs:
             echo "fixA: upstream already fixes it (patch correctly skipped)"
           else
             echo "FATAL: no address-attempt-timeout fix in the build"
+            exit 1
+          fi
+          # fixC1: the RUNTIME feed override must point at this repo. Flipping
+          # app-update.yml alone is inert on 0.3.42+ (setFeedURL wins); without
+          # this assert a regression would silently ship an upstream-tracking
+          # build, which is exactly how the 0.3.41 copy replaced itself.
+          if grep -qF "github.com/${{ github.repository }}/releases/latest/download/" \
+               work-tree/resources/asar-out/apps/desktop/dist-electron/main.cjs; then
+            echo "fixC1: runtime feed override present"
+          else
+            echo "FATAL: fixC1 missing — patched build would still update from upstream"
+            exit 1
+          fi
+          # fixC2: the transport capability must be restored, otherwise the
+          # local model transport rejects every request (403/401) and no
+          # external harness (OpenCode) can authenticate.
+          if grep -qF 'deepAIPiModels(account.transport.baseUrl, account.transport.capability, models)' \
+               work-tree/resources/asar-out/apps/server/dist/binCli-*.mjs; then
+            echo "fixC2: live transport capability restored"
+          else
+            echo "FATAL: fixC2 missing — models.json would carry the placeholder token"
             exit 1
           fi
 
@@ -183,6 +205,12 @@ jobs:
              && ! grep -qF 'configureNodeNetwork' squashfs-root/resources/app.asar 2>/dev/null; then
             echo "FATAL: no autoselect-timeout fix in packed artifact"; exit 1
           fi
+          # final-artifact gates for the two fixes that make the bridge usable
+          grep -aqF "github.com/${{ github.repository }}/releases/latest/download/" \
+            squashfs-root/resources/app.asar \
+            || { echo "FATAL: packed artifact still updates from upstream (fixC1 absent)"; exit 1; }
+          grep -aqF 'account.transport.capability, models' squashfs-root/resources/app.asar \
+            || { echo "FATAL: packed artifact lost the transport capability (fixC2 absent)"; exit 1; }
           rm -rf squashfs-root
 
       - name: Generate patched-channel manifest
