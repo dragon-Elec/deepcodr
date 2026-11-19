@@ -91,8 +91,18 @@ jobs:
           for f in work-tree/resources/asar-out/apps/server/dist/bin*.mjs; do
             node --check "$f"
           done
-          # markers present in expected files
-          grep -rlF '/* deepcodr:fixA' work-tree/resources/asar-out/apps/server/dist/bin.mjs >/dev/null
+          # The fix must be PRESENT — either ours or upstream's. 0.3.41+ already
+          # raises the address-attempt timeout itself, in which case patch.sh
+          # correctly no-ops and our marker will not exist. Asserting on the
+          # marker alone would fail every future build; assert on the fix.
+          if grep -qF 'deepcodr:fixA' work-tree/resources/asar-out/apps/server/dist/bin.mjs; then
+            echo "fixA: our injection present"
+          elif grep -qF 'configureNodeNetwork' work-tree/resources/asar-out/apps/server/dist/bin.mjs; then
+            echo "fixA: upstream already fixes it (patch correctly skipped)"
+          else
+            echo "FATAL: no address-attempt-timeout fix in the build"
+            exit 1
+          fi
 
       - name: Boot smoke — backend must listen and answer
         if: steps.skip.outputs.already-built != 'true'
@@ -166,10 +176,13 @@ jobs:
           cat runtime-stub.bin patched.squashfs > "$OUT"
           chmod +x "$OUT"
           echo "artifact=$OUT" >> "$GITHUB_OUTPUT"
-          # sanity: extractable and contains marker
+          # sanity: extractable and the network fix is in the packed code.
+          # Accept either our marker or upstream's own implementation.
           ./"$OUT" --appimage-extract >/dev/null
-          grep -qF 'deepcodr:fixA' squashfs-root/resources/app.asar \
-            || { echo "marker missing in packed artifact"; exit 1; }
+          if ! grep -qF 'deepcodr:fixA' squashfs-root/resources/app.asar 2>/dev/null \
+             && ! grep -qF 'configureNodeNetwork' squashfs-root/resources/app.asar 2>/dev/null; then
+            echo "FATAL: no autoselect-timeout fix in packed artifact"; exit 1
+          fi
           rm -rf squashfs-root
 
       - name: Generate patched-channel manifest

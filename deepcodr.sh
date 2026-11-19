@@ -297,20 +297,26 @@ cmd_pack() {
 	[ -n "$pristine" ] || die "no pristine AppImage to harvest runtime stub from"
 	local stub="$WORK/runtime-stub.bin"
 	rm -f "$stub"
-	# find the squashfs offset inside the pristine AppImage (ELF stub prefix)
+	# find the squashfs offset: it starts exactly at the end of the ELF's
+	# section-header table. Scanning for the 'hsqs' magic is WRONG — those bytes
+	# also occur inside the compressed ELF stub, which yields a truncated runtime
+	# (this exact bug segfaulted CI once; do not reintroduce the byte-scan).
 	local offset
 	offset="$(python3 - "$pristine" <<'PYEOF'
-import sys
-data = open(sys.argv[1], "rb").read(4 * 1024 * 1024)
-# AppImage magic at offset 8: "AI\x02" for type 2
-sq = b"hsqs"
-i = data.find(sq)
-print(i if i > 0 else -1)
+import struct, sys
+f = open(sys.argv[1], "rb")
+f.seek(0x28); shoff = struct.unpack('<Q', f.read(8))[0]
+f.seek(0x3a); shentsize, shnum, _s = struct.unpack('<HHH', f.read(6))
+off = shoff + shentsize * shnum
+f.seek(off)
+if f.read(4) != b'hsqs':
+    print("-1")
+else:
+    print(off)
 PYEOF
 )"
-	[ "$offset" -gt 0 ] || die "could not locate squashfs offset in pristine AppImage"
-	dd if="$pristine" of="$stub" bs=4M count=1 2>/dev/null
-	truncate -s "$offset" "$stub"
+	[ "$offset" -gt 0 ] || die "could not locate squashfs offset (magic not at ELF section-table end)"
+	dd if="$pristine" of="$stub" bs=1 count="$offset" status=none
 	log "runtime stub harvested: $offset bytes"
 
 	local out="$WORK/DeepAI-Code-patched.AppImage"
@@ -319,14 +325,17 @@ PYEOF
 	chmod +x "$out"
 	log "built: $out ($(du -h "$out" | cut -f1))"
 
-	# 5. verify: it must run --appimage-extract cleanly and contain our marker
+	# 5. verify: it must run --appimage-extract cleanly
 	local verify="$WORK/.verify.$$"
 	rm -rf "$verify"
-	"$out" --appimage-extract >/dev/null 2>&1 || die "built AppImage fails --appimage-extract"
-	grep -rlF '/* deepcodr:fixA' "$verify/squashfs-root/resources/app.asar" >/dev/null 2>&1 \
-		|| die "verification failed: fixA marker not visible in packed asar"
-	rm -rf "$verify"
-	log "verification passed: marker present in packed artifact"
+	(cd "$WORK" && "$out" --appimage-extract >/dev/null 2>&1) || die "built AppImage fails --appimage-extract"
+	# the patch may legitimately be a no-op (upstream already fixed); assert the
+	# fix is PRESENT in the final code, not that our marker string is.
+	grep -qF 'setDefaultAutoSelectFamilyAttemptTimeout' "$WORK/squashfs-root/resources/app.asar" 2>/dev/null \
+		|| grep -qF 'configureNodeNetwork' "$WORK/squashfs-root/resources/app.asar" 2>/dev/null \
+		|| die "verification failed: no autoselect-timeout fix visible in packed asar"
+	rm -rf "$WORK/squashfs-root"
+	log "verification passed: network fix present in packed artifact"
 }
 
 # ---------------- unpatch ----------------

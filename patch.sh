@@ -38,13 +38,38 @@ APPS_DIST="$ASAR_OUT/apps/server/dist"
 
 applied_a=0
 skipped_a=0
+upstream_a=0
 applied_b=0
 skipped_b=0
+upstream_b=0
+
+# Upstream may already carry these fixes (0.3.41+ ships both). Patching an
+# already-fixed build would be dead code at best; detect and skip instead of
+# stacking a second, never-reached implementation on top of theirs.
+# Order matters: OUR marker is checked first so an already-patched tree reports
+# "already applied" rather than masquerading as an upstream fix.
+UPSTREAM_FIXA=0
+if ! grep -qF "$MARKER_A" "$APPS_DIST/bin.mjs" 2>/dev/null \
+   && { grep -qF 'configureNodeNetwork()' "$APPS_DIST/bin.mjs" 2>/dev/null \
+        || grep -qF 'ADDRESS_ATTEMPT_TIMEOUT_MS' "$APPS_DIST"/nodeNetwork-*.mjs 2>/dev/null; }; then
+	UPSTREAM_FIXA=1
+fi
+UPSTREAM_FIXB=0
+if ! grep -qF "$MARKER_B" "$APPS_DIST"/binCli-*.mjs 2>/dev/null \
+   && grep -qF 'parseLinuxMachineId' "$APPS_DIST"/binCli-*.mjs 2>/dev/null; then
+	UPSTREAM_FIXB=1
+fi
 
 # ---------- FIX A: every entrypoint .mjs gets the net fix ----------
+if [ "$UPSTREAM_FIXA" -eq 1 ]; then
+	echo "fixA: upstream already raises the address-attempt timeout — not patching (no-op by design)"
+	upstream_a=1
+fi
+
 FIX_A_IMPORT='import { setDefaultAutoSelectFamilyAttemptTimeout } from "node:net";'
 FIX_A_CALL='try { setDefaultAutoSelectFamilyAttemptTimeout(5000); } catch (e) { process.stderr.write("deepcodr: fixA failed: " + e + "\n"); }'
 
+if [ "$UPSTREAM_FIXA" -eq 0 ]; then
 for entry in "$APPS_DIST"/bin.mjs "$APPS_DIST"/binCli-*.mjs; do
 	[ -f "$entry" ] || continue
 	if grep -qF "$MARKER_A" "$entry"; then
@@ -79,8 +104,15 @@ if [ $((applied_a + skipped_a)) -eq 0 ]; then
 	echo "FATAL: no entrypoints found in $APPS_DIST (version drift?)" >&2
 	exit 1
 fi
+fi   # end UPSTREAM_FIXA == 0
 
 # ---------- FIX B: optional Linux machine-id branch ----------
+if [ "$WANT_MACHINE_ID" -eq 1 ] && [ "$UPSTREAM_FIXB" -eq 1 ]; then
+	echo "fixB: upstream already reads /etc/machine-id on Linux — not patching"
+	upstream_b=1
+	WANT_MACHINE_ID=0
+fi
+
 if [ "$WANT_MACHINE_ID" -eq 1 ]; then
 	# Locate the detect() function by symbol anchor, not by hashed filename.
 	target=""
@@ -147,5 +179,5 @@ PYEOF
 	fi
 fi
 
-echo "patch summary: fixA applied=$applied_a skipped=$skipped_a | fixB applied=$applied_b skipped=$skipped_b requested=$WANT_MACHINE_ID"
+echo "patch summary: fixA applied=$applied_a skipped=$skipped_a upstream=$upstream_a | fixB applied=$applied_b skipped=$skipped_b upstream=$upstream_b requested=$WANT_MACHINE_ID"
 exit 0
