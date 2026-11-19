@@ -8,7 +8,12 @@ name: build-patched
 "on":
   schedule:
     - cron: "17 */6 * * *"   # every 6h, off-the-hour to dodge busy minutes
-  workflow_dispatch: {}       # manual trigger for testing
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild an already-released version (deletes that release first)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write             # needed to create releases
@@ -41,8 +46,14 @@ jobs:
         run: |
           tag="deepai-v${{ steps.upstream.outputs.version }}"
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "already-built=true" >> "$GITHUB_OUTPUT"
-            echo "release $tag exists — nothing to do"
+            if [ "${{ inputs.force }}" = "true" ]; then
+              echo "release $tag exists — force requested, deleting to rebuild"
+              gh release delete "$tag" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag
+              echo "already-built=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "already-built=true" >> "$GITHUB_OUTPUT"
+              echo "release $tag exists — nothing to do"
+            fi
           else
             echo "already-built=false" >> "$GITHUB_OUTPUT"
           fi
@@ -236,7 +247,7 @@ jobs:
             --notes "$(cat <<NOTES
           Patched build of DeepAI Code Linux (upstream ${{ steps.upstream.outputs.version }}).
 
-          **Fixes:** fixA — Node Happy-Eyeballs connect cutoff (5000ms), applied to all server/CLI entrypoints.
+          **Fixes:** C1 — self-hosted update feed (runtime setFeedURL override); C2 — live transport capability restored in models.json; fixA — Node Happy-Eyeballs connect cutoff, applied to every server/CLI entrypoint whenever upstream has not already fixed it.
           **Not included:** fixB (machine-id) — opt-in locally via \`deepcodr patch-local --machine-id\`.
 
           **Provenance:**
